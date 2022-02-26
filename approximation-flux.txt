@@ -1,0 +1,66 @@
+import "math"
+
+deviceId                       = "robert-esp32"
+telemetryDefinitionKey         = "belt_scale"
+
+speedSensorKey                 = "speedSensor"
+leftLoadCellKey                = "leftLoadCell"
+rightLoadCellKey               = "rightLoadCell"
+
+pi_value                       = 3.14
+leftLoadCellZeroPoundVolts     = 1.9500
+rightLoadCellZeroPoundVolts    = 1.8940
+poundsPerVolt                  = 310.0000
+rpmPerVolt                     = 1419.0000
+speedWheelDiameterFeet         = 0.2000
+miliVoltsPerVolt               = 1000.0000
+nanoSecondsPerMinute           = 60000000000.00000
+feetBetweenRollers             = 2.000
+
+leftLoadCell = from(bucket: "DeviceEvents")
+    |> range(start: v.timeRangeStart, stop:v.timeRangeStop)
+    |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+    |> filter(fn: (r) => 
+        r.telemetryDefinitionKey == telemetryDefinitionKey and 
+        r.telemetryAttributeDefinitionKey == leftLoadCellKey and 
+        r.deviceId == deviceId)
+    |> map(fn:(r) => ({ r with value: ((float(v: r.value) / miliVoltsPerVolt) - leftLoadCellZeroPoundVolts) *  poundsPerVolt }))
+
+rightLoadCell = from(bucket: "DeviceEvents")
+    |> range(start: v.timeRangeStart, stop:v.timeRangeStop)
+    |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+    |> filter(fn: (r) => 
+        r.telemetryDefinitionKey == telemetryDefinitionKey and 
+        r.telemetryAttributeDefinitionKey == rightLoadCellKey and 
+        r.deviceId == deviceId)
+    |> map(fn:(r) => ({ r with value:  ((float(v: r.value) / miliVoltsPerVolt) - rightLoadCellZeroPoundVolts) *  poundsPerVolt }))
+
+totalWeight = join(tables: {left:leftLoadCell, right:rightLoadCell}, on: ["_time", "_stop", "_start"])
+    |> map(fn: (r) => ({ r with weight_pounds: r.value_right + r.value_left }))
+
+speed = from(bucket: "DeviceEvents")
+    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+    |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+    |> filter(fn: (r) => 
+        r.telemetryDefinitionKey == telemetryDefinitionKey and 
+        r.telemetryAttributeDefinitionKey == speedSensorKey and 
+        r.deviceId == deviceId)
+    |> map(fn:(r) => ({ r with rpm: ((float(v: r.value) / miliVoltsPerVolt) * rpmPerVolt) }))
+
+getDurationInMinutes = (nanoSecondTimeOne, nanoSecondTimeTwo) => 
+    math.abs(x: (float(v: nanoSecondTimeOne) - float(v: nanoSecondTimeTwo)) / nanoSecondsPerMinute)
+
+join(tables: {weight:totalWeight, speed: speed}, on: ["_time", "_stop", "_start"])
+    |> keep(columns: ["_time", "_start", "_stop", "deviceId", "rpm", "weight_pounds"])
+    |> window(every: 1m)
+    |> reduce(fn: (r, accumulator) => ({
+            weight: accumulator.weight + (r.weight_pounds * (r.rpm * pi_value * speedWheelDiameterFeet * 
+                getDurationInMinutes(
+                nanoSecondTimeOne: uint(v: r._time), 
+                nanoSecondTimeTwo: if accumulator.lastEvent == uint(v: 0) then uint(v: r._start) else uint(v: accumulator.lastEvent)) * 2.0000) / feetBetweenRollers ),
+            lastEvent: uint(v: r._time),
+        }),
+        identity: {weight: 0.0, lastEvent: uint(v: 0)}
+    )
+    |> group()
+    |> drop(columns: ["lastEvent"])
